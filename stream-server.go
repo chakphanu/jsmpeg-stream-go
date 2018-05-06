@@ -1,16 +1,17 @@
 package main
 
 import (
-	"github.com/gorilla/websocket"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 
-	"log"
-	"net/http"
 	"flag"
-	"strconv"
 	"fmt"
-	"io/ioutil"
 	"io"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"strconv"
 )
 
 type Client struct {
@@ -22,8 +23,8 @@ type Client struct {
 
 func NewClient(ws *websocket.Conn, unregisterChan chan *Client) *Client {
 	client := &Client{
-		ws: ws,
-		sendChan: make(chan *[]byte, 512),
+		ws:             ws,
+		sendChan:       make(chan *[]byte, 512),
 		unregisterChan: unregisterChan,
 	}
 
@@ -61,7 +62,7 @@ func (c *Client) WriteHandler() {
 
 	for {
 		select {
-		case data, ok := <- c.sendChan:
+		case data, ok := <-c.sendChan:
 			if !ok {
 				log.Println("Client send failed")
 				c.ws.WriteMessage(websocket.CloseMessage, []byte{})
@@ -79,10 +80,10 @@ func (c *Client) Run() {
 }
 
 type WebSocketHandler struct {
-	clients map[*Client]bool  // *client -> is connected (true/false)
-	register chan *Client
+	clients    map[*Client]bool // *client -> is connected (true/false)
+	register   chan *Client
 	unregister chan *Client
-	broadcast chan *[]byte
+	broadcast  chan *[]byte
 
 	upgrader *websocket.Upgrader
 
@@ -91,13 +92,13 @@ type WebSocketHandler struct {
 
 func NewWebSocketHandler(params *Params) *WebSocketHandler {
 	clientManager := &WebSocketHandler{
-		clients: make(map[*Client]bool),
-		register: make(chan *Client),
+		clients:    make(map[*Client]bool),
+		register:   make(chan *Client),
 		unregister: make(chan *Client),
-		broadcast: make(chan *[]byte),
-		portNum: params.websocketPort,
+		broadcast:  make(chan *[]byte),
+		portNum:    params.websocketPort,
 		upgrader: &websocket.Upgrader{
-			ReadBufferSize: params.readBufferSize,
+			ReadBufferSize:  params.readBufferSize,
 			WriteBufferSize: params.writeBufferSize,
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -127,7 +128,7 @@ func (h *WebSocketHandler) Run() {
 			log.Printf("New client registered. Total: %d\n", len(h.clients))
 			break
 
-		case client := <- h.unregister:
+		case client := <-h.unregister:
 			_, ok := h.clients[client]
 			if ok {
 				delete(h.clients, client)
@@ -135,7 +136,7 @@ func (h *WebSocketHandler) Run() {
 			log.Printf("Client unregistered.   Total: %d\n", len(h.clients))
 			break
 
-		case data := <- h.broadcast:
+		case data := <-h.broadcast:
 			h.BroadcastData(data)
 			break
 		}
@@ -148,12 +149,13 @@ func (h *WebSocketHandler) RunHTTPServer() {
 
 	srv := &http.Server{
 		Handler: r,
-		Addr: fmt.Sprintf("0.0.0.0:%d", h.portNum),
+		Addr:    fmt.Sprintf("0.0.0.0:%d", h.portNum),
 	}
 
-	log.Println("WebSocketHandler starting")
+	log.Println("WebSocketHandler starting  " + srv.Addr)
 
-	srv.ListenAndServe()
+	//srv.ListenAndServe()
+	srv.ListenAndServeTLS("localhost.crt", "localhost.key")
 }
 
 func (h *WebSocketHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
@@ -178,18 +180,18 @@ func (h *WebSocketHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 type IncomingStreamHandler struct {
 	clientManager *WebSocketHandler
-	width uint16
-	height uint16
+	width         uint16
+	height        uint16
 
-	secret string
+	secret  string
 	portNum int
 }
 
 func NewIncomingStreamHandler(params *Params, clientManager *WebSocketHandler) *IncomingStreamHandler {
 	incomingStreamHandler := &IncomingStreamHandler{
 		clientManager: clientManager,
-		secret: params.secret,
-		portNum: params.incomingPort,
+		secret:        params.secret,
+		portNum:       params.incomingPort,
 	}
 
 	return incomingStreamHandler
@@ -218,18 +220,47 @@ func (s *IncomingStreamHandler) Run() {
 
 	srv := &http.Server{
 		Handler: r,
-		Addr: fmt.Sprintf("0.0.0.0:%d", s.portNum),
+		Addr:    fmt.Sprintf("0.0.0.0:%d", s.portNum),
 	}
 
 	srv.ListenAndServe()
 }
 
-type Params struct {
-	secret string
-	websocketPort int
-	incomingPort int
+func (s *IncomingStreamHandler) RunMulticast() {
+	port := "239.255.1.1:1234" // multicast group address & port
+	protocol := "udp"
+	udpAddr, err := net.ResolveUDPAddr(protocol, port)
+	if err != nil {
+		fmt.Println("Wrong Address")
+		return
+	}
+	fmt.Println("Reading " + protocol + " from " + udpAddr.String())
 
-	readBufferSize int
+	// subscribe socket to multicast group address & port
+	udpConn, err := net.ListenMulticastUDP(protocol, nil, udpAddr)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	for {
+		buf := make([]byte, 1024)
+		_, err := udpConn.Read(buf)
+		if err != nil {
+			fmt.Println("Error Reading")
+			return
+		} else {
+			s.clientManager.BroadcastData(&buf)
+		}
+	}
+
+}
+
+type Params struct {
+	secret        string
+	websocketPort int
+	incomingPort  int
+
+	readBufferSize  int
 	writeBufferSize int
 }
 
@@ -260,6 +291,7 @@ func main() {
 
 	go websocketHandler.Run()
 	go incomingStreamHandler.Run()
+	go incomingStreamHandler.RunMulticast()
 
 	r := mux.NewRouter()
 	r.PathPrefix("/static").Handler(http.StripPrefix("/static", http.FileServer(http.Dir("static/"))))
